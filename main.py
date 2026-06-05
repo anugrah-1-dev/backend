@@ -300,19 +300,6 @@ def measure_head(req: MeasureHeadRequest):
         # Biparietal diameter = horizontal width of head from front view.
         biparietal_px = float(w_bb)
         a_cm = (biparietal_px / 2.0) / pixels_per_cm   # semi-major axis (measured)
-
-        # Hard sanity check: infant biparietal diameter is 6–14 cm.
-        biparietal_cm = a_cm * 2
-        if not (6.0 <= biparietal_cm <= 14.0):
-            return {
-                "success": False,
-                "message": (
-                    f"Lebar kepala terdeteksi {biparietal_cm:.1f} cm — di luar rentang normal bayi "
-                    "(6–14 cm). Pastikan foto dari depan wajah, marker tegak di samping kepala, "
-                    "dan seluruh kepala masuk frame."
-                ),
-            }
-
         b_cm = a_cm * HEAD_DEPTH_RATIO                  # semi-minor axis (estimated)
 
         # Ramanujan approximation: C ≈ π[3(a+b) − √((3a+b)(a+3b))]
