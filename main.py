@@ -186,7 +186,9 @@ def measure_head(req: MeasureHeadRequest):
         marker_corners = corners[0][0]
         width_px = math.dist(marker_corners[0], marker_corners[1])
         height_px = math.dist(marker_corners[1], marker_corners[2])
-        marker_size_px = (width_px + height_px) / 2.0
+        # Front-facing: marker lies flat → vertical dimension is foreshortened.
+        # Use the LARGEST edge (least foreshortened) for a more accurate scale.
+        marker_size_px = max(width_px, height_px)
 
         if marker_size_px < 10:
             return {
@@ -238,11 +240,27 @@ def measure_head(req: MeasureHeadRequest):
         min_area_px = math.pi * (pixels_per_cm * min_radius_cm) ** 2
         max_area_px = math.pi * (pixels_per_cm * max_radius_cm) ** 2
 
+        # Biparietal diameter for babies: 6–14 cm → half-width in pixels
+        min_bip_px = pixels_per_cm * 6.0
+        max_bip_px = pixels_per_cm * 14.0
+
+        def valid_front_head(cnt):
+            """Extra filter for front-facing view: check bounding-box width
+            (biparietal) and aspect ratio (head is roughly as wide as tall)."""
+            if cv2.contourArea(cnt) < min_area_px or cv2.contourArea(cnt) > max_area_px:
+                return False
+            _x, _y, w, h = cv2.boundingRect(cnt)
+            if not (min_bip_px <= w <= max_bip_px):
+                return False
+            aspect = w / h if h > 0 else 0
+            # From front, head aspect ratio (w/h) should be 0.5 – 1.4
+            return 0.5 <= aspect <= 1.4
+
         candidates = [
             cnt
             for cnt in contours
             if len(cnt) >= 5
-            and min_area_px <= cv2.contourArea(cnt) <= max_area_px
+            and valid_front_head(cnt)
             and contour_circularity(cnt) >= 0.3
         ]
 
@@ -282,6 +300,19 @@ def measure_head(req: MeasureHeadRequest):
         # Biparietal diameter = horizontal width of head from front view.
         biparietal_px = float(w_bb)
         a_cm = (biparietal_px / 2.0) / pixels_per_cm   # semi-major axis (measured)
+
+        # Hard sanity check: infant biparietal diameter is 6–14 cm.
+        biparietal_cm = a_cm * 2
+        if not (6.0 <= biparietal_cm <= 14.0):
+            return {
+                "success": False,
+                "message": (
+                    f"Lebar kepala terdeteksi {biparietal_cm:.1f} cm — di luar rentang normal bayi "
+                    "(6–14 cm). Pastikan foto dari depan wajah, marker tegak di samping kepala, "
+                    "dan seluruh kepala masuk frame."
+                ),
+            }
+
         b_cm = a_cm * HEAD_DEPTH_RATIO                  # semi-minor axis (estimated)
 
         # Ramanujan approximation: C ≈ π[3(a+b) − √((3a+b)(a+3b))]
