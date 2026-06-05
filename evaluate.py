@@ -46,6 +46,21 @@ DATA_LINGKAR_KEPALA = [
     (36.0, 36.8),
 ]
 
+DATA_BERAT_BADAN = [
+    # (ground_truth_kg, sistem_kg)
+    # Contoh data — GANTI dengan data pengujianmu:
+    (5.0, 5.1),
+    (6.5, 6.4),
+    (7.2, 7.3),
+    (8.0, 7.9),
+    (4.5, 4.6),
+    (9.0, 9.1),
+    (6.0, 5.9),
+    (7.8, 7.7),
+    (8.5, 8.6),
+    (5.5, 5.4),
+]
+
 # =============================================================================
 
 def hitung_mae(data):
@@ -57,17 +72,17 @@ def hitung_rmse(data):
 def hitung_mape(data):
     return (sum(abs((true - pred) / true) for true, pred in data) / len(data)) * 100
 
-def cetak_tabel(data, label):
+def cetak_tabel(data, label, satuan="cm"):
     print(f"\n{'─'*55}")
     print(f"  {'No':<5} {'Ground Truth':>14} {'Sistem':>10} {'Selisih':>10}")
     print(f"{'─'*55}")
     for i, (true, pred) in enumerate(data, 1):
         selisih = pred - true
         tanda = "+" if selisih >= 0 else ""
-        print(f"  {i:<5} {true:>12.1f} cm  {pred:>8.1f} cm  {tanda}{selisih:>7.1f} cm")
+        print(f"  {i:<5} {true:>12.1f} {satuan}  {pred:>8.1f} {satuan}  {tanda}{selisih:>7.1f} {satuan}")
     print(f"{'─'*55}")
 
-def evaluasi(data, label):
+def evaluasi(data, label, satuan="cm"):
     if len(data) == 0:
         print(f"\n[!] Tidak ada data untuk {label}")
         return
@@ -84,13 +99,13 @@ def evaluasi(data, label):
     print(f"\n{'═'*55}")
     print(f"  EVALUASI {label.upper()}")
     print(f"{'═'*55}")
-    cetak_tabel(data, label)
+    cetak_tabel(data, label, satuan)
     print(f"\n  Jumlah sampel  : {len(data)}")
-    print(f"  MAE            : {mae:.4f} cm")
-    print(f"  RMSE           : {rmse:.4f} cm")
+    print(f"  MAE            : {mae:.4f} {satuan}")
+    print(f"  RMSE           : {rmse:.4f} {satuan}")
     print(f"  MAPE           : {mape:.4f} %")
-    print(f"  Error terbesar : {max_err:.2f} cm")
-    print(f"  Error terkecil : {min_err:.2f} cm")
+    print(f"  Error terbesar : {max_err:.2f} {satuan}")
+    print(f"  Error terkecil : {min_err:.2f} {satuan}")
 
     # Penilaian
     print(f"\n  Penilaian:")
@@ -110,7 +125,8 @@ if __name__ == "__main__":
     print("  EVALUASI AKURASI PENGUKURAN CITRA - POSYLIKE V2")
     print("█"*55)
 
-    evaluasi(DATA_TINGGI_BADAN,  "Tinggi Badan")
+    evaluasi(DATA_TINGGI_BADAN,   "Tinggi Badan")
     evaluasi(DATA_LINGKAR_KEPALA, "Lingkar Kepala")
+    evaluasi(DATA_BERAT_BADAN,    "Berat Badan", satuan="kg")
 
     print("\nSelesai. Salin hasil di atas ke laporan / PPT kamu.\n")

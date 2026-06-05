@@ -175,7 +175,10 @@ def measure_head(req: MeasureHeadRequest):
         marker_size_px = (width_px + height_px) / 2.0
 
         if marker_size_px < 10:
-            return {"success": False, "message": "Marker terlalu kecil. Dekatkan kamera."}
+            return {
+                "success": False,
+                "message": "Marker terlalu kecil. Dekatkan kamera.",
+            }
 
         pixels_per_cm = marker_size_px / MARKER_PHYSICAL_SIZE_CM
 
@@ -189,8 +192,8 @@ def measure_head(req: MeasureHeadRequest):
 
         # ── Step 3: Skin segmentation in YCrCb space ───────────────────
         ycrcb = cv2.cvtColor(image, cv2.COLOR_BGR2YCrCb)
-        # Broad skin range that covers light to dark skin tones
-        skin_mask = cv2.inRange(ycrcb, (0, 130, 75), (255, 180, 135))
+        # Skin range tuned for infant skin (light to dark tones)
+        skin_mask = cv2.inRange(ycrcb, (0, 133, 77), (255, 173, 127))
 
         # Remove marker area from skin mask
         skin_mask[marker_exclude > 0] = 0
@@ -201,8 +204,10 @@ def measure_head(req: MeasureHeadRequest):
         skin_mask = cv2.morphologyEx(skin_mask, cv2.MORPH_CLOSE, k_close)
         skin_mask = cv2.morphologyEx(skin_mask, cv2.MORPH_OPEN, k_open)
 
-        # ── Step 4: Find the largest contour (head) ─────────────────────
-        contours, _ = cv2.findContours(skin_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        # ── Step 4: Find the best contour for the head ──────────────────
+        contours, _ = cv2.findContours(
+            skin_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE
+        )
 
         if not contours:
             return {
@@ -210,21 +215,59 @@ def measure_head(req: MeasureHeadRequest):
                 "message": "Kepala tidak terdeteksi. Pastikan foto diambil dari atas dengan cahaya cukup dan kepala terlihat penuh.",
             }
 
-        largest = max(contours, key=cv2.contourArea)
+        def contour_circularity(cnt):
+            area = cv2.contourArea(cnt)
+            perimeter = cv2.arcLength(cnt, True)
+            if perimeter == 0:
+                return 0.0
+            return 4 * math.pi * area / (perimeter * perimeter)
 
-        if len(largest) < 5:
-            return {"success": False, "message": "Kontur kepala terlalu kecil atau tidak jelas."}
+        # Size bounds based on calibration.
+        # Head radius expected ~3–12 cm (covers preemie to large head with margin).
+        # This prevents picking up large body/background skin blobs.
+        min_radius_cm = 3.0
+        max_radius_cm = 12.0
+        min_area_px = math.pi * (pixels_per_cm * min_radius_cm) ** 2
+        max_area_px = math.pi * (pixels_per_cm * max_radius_cm) ** 2
 
-        # Area sanity check: head must be reasonably large
-        min_area_px = (pixels_per_cm * 8) ** 2  # min ~8cm radius
-        if cv2.contourArea(largest) < min_area_px:
-            return {
-                "success": False,
-                "message": "Kepala terdeteksi terlalu kecil. Dekatkan kamera ke kepala bayi.",
-            }
+        # Prefer contours that are circular and within the expected size range
+        candidates = [
+            cnt
+            for cnt in contours
+            if len(cnt) >= 5
+            and min_area_px <= cv2.contourArea(cnt) <= max_area_px
+            and contour_circularity(cnt) >= 0.3
+        ]
 
-        # ── Step 5: Fit ellipse and compute circumference ───────────────
-        ellipse = cv2.fitEllipse(largest)
+        if candidates:
+            # Among valid candidates, pick the largest (most likely the head)
+            largest = max(candidates, key=cv2.contourArea)
+        else:
+            # Fallback: pick largest contour within size bounds (ignore circularity)
+            size_filtered = [
+                cnt
+                for cnt in contours
+                if len(cnt) >= 5
+                and cv2.contourArea(cnt) >= min_area_px
+                and cv2.contourArea(cnt) <= max_area_px
+            ]
+            if size_filtered:
+                largest = max(size_filtered, key=cv2.contourArea)
+            else:
+                # Last resort: just use the largest contour
+                largest = max(contours, key=cv2.contourArea)
+                if len(largest) < 5:
+                    return {
+                        "success": False,
+                        "message": "Kontur kepala tidak terdeteksi dengan jelas.",
+                    }
+
+        # ── Step 5: Fit ellipse using convex hull for stability ─────────
+        # Convex hull smooths jagged edges caused by hair/lighting
+        hull = cv2.convexHull(largest)
+        fit_target = hull if len(hull) >= 5 else largest
+
+        ellipse = cv2.fitEllipse(fit_target)
         a_px = ellipse[1][0] / 2.0  # semi-axis 1
         b_px = ellipse[1][1] / 2.0  # semi-axis 2
 
@@ -233,15 +276,20 @@ def measure_head(req: MeasureHeadRequest):
 
         # Ramanujan approximation: C ≈ π[3(a+b) − √((3a+b)(a+3b))]
         h_val = ((a_cm - b_cm) ** 2) / ((a_cm + b_cm) ** 2)
-        circumference_cm = math.pi * (a_cm + b_cm) * (
-            1 + (3 * h_val) / (10 + math.sqrt(4 - 3 * h_val))
+        circumference_cm = (
+            math.pi
+            * (a_cm + b_cm)
+            * (1 + (3 * h_val) / (10 + math.sqrt(4 - 3 * h_val)))
         )
 
-        if circumference_cm < 25 or circumference_cm > 60:
-            return {
-                "success": False,
-                "message": f"Hasil tidak masuk akal ({circumference_cm:.1f} cm). Pastikan foto dari tepat atas dan kepala terlihat penuh.",
-            }
+        # Return result always – no hard block.
+        # Add an informational warning if outside typical infant range.
+        warning = None
+        if circumference_cm < 20 or circumference_cm > 65:
+            warning = (
+                f"Nilai terukur {circumference_cm:.1f} cm di luar rentang normal bayi "
+                "(20–65 cm). Periksa foto dan ulangi jika perlu, atau gunakan hasil ini jika yakin."
+            )
 
         return {
             "success": True,
@@ -249,6 +297,7 @@ def measure_head(req: MeasureHeadRequest):
             "pixels_per_cm": round(pixels_per_cm, 4),
             "ellipse_a_cm": round(a_cm, 2),
             "ellipse_b_cm": round(b_cm, 2),
+            "warning": warning,
         }
 
     except Exception as e:
