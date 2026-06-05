@@ -24,6 +24,10 @@ app.add_middleware(
 
 MARKER_PHYSICAL_SIZE_CM = 10.0  # ArUco marker is 10cm × 10cm
 
+# Anthropometric ratio: infant head depth (front-to-back) / width (left-right).
+# Based on neonatal/infant cephalic index studies (~78–82%). Using 0.80 as midpoint.
+HEAD_DEPTH_RATIO = 0.80
+
 
 class MeasureRequest(BaseModel):
     image_base64: str
@@ -143,9 +147,19 @@ def calculate(req: CalculateRequest):
 @app.post("/measure_head")
 def measure_head(req: MeasureHeadRequest):
     """
-    Measure head circumference from a top-down photo.
-    Requires ArUco marker (DICT_4X4_50, 10cm×10cm) visible in the image.
-    Uses skin-color segmentation + ellipse fitting (Ramanujan approximation).
+    Measure head circumference from a FRONT-FACING photo (baby lying down,
+    camera pointing at the baby's face from the front).
+
+    Requires ArUco marker (DICT_4X4_50, 10cm×10cm) placed beside the baby's
+    head on the same surface level.
+
+    Algorithm:
+      1. Detect ArUco marker → pixels_per_cm calibration.
+      2. Skin segmentation (YCrCb) to isolate the head/face region.
+      3. Find the largest circular skin blob near the top of the frame.
+      4. Measure its horizontal bounding-box width → biparietal diameter (2a).
+      5. Estimate head depth: b = a × HEAD_DEPTH_RATIO (0.80).
+      6. Circumference via Ramanujan ellipse approximation.
     """
     try:
         image_bytes = base64.b64decode(req.image_base64)
@@ -166,7 +180,7 @@ def measure_head(req: MeasureHeadRequest):
         if ids is None or len(ids) == 0:
             return {
                 "success": False,
-                "message": "ArUco marker tidak terdeteksi. Pastikan marker 10×10 cm terlihat jelas di foto.",
+                "message": "ArUco marker tidak terdeteksi. Pastikan marker 10×10 cm terlihat jelas di samping kepala bayi.",
             }
 
         marker_corners = corners[0][0]
@@ -186,25 +200,21 @@ def measure_head(req: MeasureHeadRequest):
         h_img, w_img = image.shape[:2]
         marker_exclude = np.zeros((h_img, w_img), dtype=np.uint8)
         cv2.fillPoly(marker_exclude, [marker_corners.astype(np.int32)], 255)
-        # Dilate mask slightly so marker border doesn't pollute skin detection
         kernel_dilate = cv2.getStructuringElement(cv2.MORPH_RECT, (20, 20))
         marker_exclude = cv2.dilate(marker_exclude, kernel_dilate)
 
         # ── Step 3: Skin segmentation in YCrCb space ───────────────────
         ycrcb = cv2.cvtColor(image, cv2.COLOR_BGR2YCrCb)
-        # Skin range tuned for infant skin (light to dark tones)
         skin_mask = cv2.inRange(ycrcb, (0, 133, 77), (255, 173, 127))
-
-        # Remove marker area from skin mask
         skin_mask[marker_exclude > 0] = 0
 
-        # Morphological cleanup: close small holes, open noise
+        # Morphological cleanup
         k_close = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (25, 25))
         k_open = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (10, 10))
         skin_mask = cv2.morphologyEx(skin_mask, cv2.MORPH_CLOSE, k_close)
         skin_mask = cv2.morphologyEx(skin_mask, cv2.MORPH_OPEN, k_open)
 
-        # ── Step 4: Find the best contour for the head ──────────────────
+        # ── Step 4: Find the best head contour ─────────────────────────
         contours, _ = cv2.findContours(
             skin_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE
         )
@@ -212,7 +222,7 @@ def measure_head(req: MeasureHeadRequest):
         if not contours:
             return {
                 "success": False,
-                "message": "Kepala tidak terdeteksi. Pastikan foto diambil dari atas dengan cahaya cukup dan kepala terlihat penuh.",
+                "message": "Kepala tidak terdeteksi. Pastikan foto dari depan dengan cahaya cukup dan wajah terlihat penuh.",
             }
 
         def contour_circularity(cnt):
@@ -222,15 +232,12 @@ def measure_head(req: MeasureHeadRequest):
                 return 0.0
             return 4 * math.pi * area / (perimeter * perimeter)
 
-        # Size bounds based on calibration.
-        # Head radius expected ~3–12 cm (covers preemie to large head with margin).
-        # This prevents picking up large body/background skin blobs.
+        # Size bounds: head radius ~3–12 cm
         min_radius_cm = 3.0
         max_radius_cm = 12.0
         min_area_px = math.pi * (pixels_per_cm * min_radius_cm) ** 2
         max_area_px = math.pi * (pixels_per_cm * max_radius_cm) ** 2
 
-        # Prefer contours that are circular and within the expected size range
         candidates = [
             cnt
             for cnt in contours
@@ -240,10 +247,16 @@ def measure_head(req: MeasureHeadRequest):
         ]
 
         if candidates:
-            # Among valid candidates, pick the largest (most likely the head)
-            largest = max(candidates, key=cv2.contourArea)
+            # From front view, the head is typically in the upper portion of the
+            # frame. Score by circularity + position (prefer higher in image).
+            def head_score(cnt):
+                _, cy_c, _, _ = cv2.boundingRect(cnt)
+                # Normalise y to [0,1]: lower y = higher in image = better
+                y_norm = cy_c / h_img
+                return contour_circularity(cnt) - 0.5 * y_norm
+
+            largest = max(candidates, key=head_score)
         else:
-            # Fallback: pick largest contour within size bounds (ignore circularity)
             size_filtered = [
                 cnt
                 for cnt in contours
@@ -254,7 +267,6 @@ def measure_head(req: MeasureHeadRequest):
             if size_filtered:
                 largest = max(size_filtered, key=cv2.contourArea)
             else:
-                # Last resort: just use the largest contour
                 largest = max(contours, key=cv2.contourArea)
                 if len(largest) < 5:
                     return {
@@ -262,17 +274,15 @@ def measure_head(req: MeasureHeadRequest):
                         "message": "Kontur kepala tidak terdeteksi dengan jelas.",
                     }
 
-        # ── Step 5: Fit ellipse using convex hull for stability ─────────
-        # Convex hull smooths jagged edges caused by hair/lighting
+        # ── Step 5: Measure biparietal width → estimate circumference ───
+        # Use convex hull for a clean bounding box unaffected by concavities.
         hull = cv2.convexHull(largest)
-        fit_target = hull if len(hull) >= 5 else largest
+        x_bb, _y_bb, w_bb, _h_bb = cv2.boundingRect(hull)
 
-        ellipse = cv2.fitEllipse(fit_target)
-        a_px = ellipse[1][0] / 2.0  # semi-axis 1
-        b_px = ellipse[1][1] / 2.0  # semi-axis 2
-
-        a_cm = a_px / pixels_per_cm
-        b_cm = b_px / pixels_per_cm
+        # Biparietal diameter = horizontal width of head from front view.
+        biparietal_px = float(w_bb)
+        a_cm = (biparietal_px / 2.0) / pixels_per_cm   # semi-major axis (measured)
+        b_cm = a_cm * HEAD_DEPTH_RATIO                  # semi-minor axis (estimated)
 
         # Ramanujan approximation: C ≈ π[3(a+b) − √((3a+b)(a+3b))]
         h_val = ((a_cm - b_cm) ** 2) / ((a_cm + b_cm) ** 2)
@@ -282,8 +292,6 @@ def measure_head(req: MeasureHeadRequest):
             * (1 + (3 * h_val) / (10 + math.sqrt(4 - 3 * h_val)))
         )
 
-        # Return result always – no hard block.
-        # Add an informational warning if outside typical infant range.
         warning = None
         if circumference_cm < 20 or circumference_cm > 65:
             warning = (
@@ -295,8 +303,8 @@ def measure_head(req: MeasureHeadRequest):
             "success": True,
             "head_circumference_cm": round(circumference_cm, 1),
             "pixels_per_cm": round(pixels_per_cm, 4),
-            "ellipse_a_cm": round(a_cm, 2),
-            "ellipse_b_cm": round(b_cm, 2),
+            "biparietal_cm": round(a_cm * 2, 2),
+            "estimated_depth_cm": round(b_cm * 2, 2),
             "warning": warning,
         }
 
