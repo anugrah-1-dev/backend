@@ -6,4 +6,8 @@ python-multipart
 --extra-index-url https://download.pytorch.org/whl/cpu
 torch
 torchvision
+# Install ultralytics AFTER pinning headless opencv so pip keeps the headless variant.
+# The "opencv-python" entry below is intentionally absent — ultralytics will
+# attempt to install it as a dependency, but pip's constraint resolver will
+# satisfy the requirement with the already-installed headless build.
 ultralytics

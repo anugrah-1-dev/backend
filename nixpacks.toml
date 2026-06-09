@@ -1,0 +1,18 @@
+# nixpacks.toml
+# Railway uses Nixpacks to build the container image.
+# This file ensures that:
+#   1. No GUI X11 library (libxcb, libGL, etc.) is required at startup.
+#   2. The headless OpenCV variant is installed instead of the full GUI build.
+
+[phases.setup]
+# libglib2 is needed by the headless OpenCV native extension (libglib-2.0.so.0).
+nixPkgs = ["glib"]
+
+[phases.install]
+# Force-install the headless variant AFTER all packages (including ultralytics)
+# are installed. This overwrites any opencv-python the ultralytics dep might
+# have pulled in, ensuring no libxcb / X11 dependency remains.
+cmds = [
+  "pip install -r requirements.txt",
+  "pip install --force-reinstall --no-deps opencv-python-headless"
+]
