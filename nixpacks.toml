@@ -1,21 +1,12 @@
 # nixpacks.toml
-# Railway uses Nixpacks to build the container image.
-# This file ensures the headless OpenCV variant is used (no libxcb/X11 needed).
-
-[phases.setup]
-# libglib2 is needed by the headless OpenCV native extension (libglib-2.0.so.0).
-nixPkgs = ["glib"]
-
-# NOTE: Do NOT override [phases.install] cmds here.
-# If we override install cmds, `pip` won't be found because /opt/venv/bin
-# is not yet in PATH at that stage (PATH is set in step 8, pip runs at step 6).
+# Ensures opencv-python-headless wins over opencv-python (GUI) that
+# ultralytics pulls in — which requires libxcb (X11) not available on Railway.
 #
-# Instead, we use [phases.build] which runs AFTER the default install phase
-# (and after /opt/venv is fully set up), using the full pip path.
+# Strategy: Let Nixpacks auto-detect Python/pip normally (do NOT override
+# [phases.setup] nixPkgs — it replaces instead of merges, breaking Python).
+# After the default install phase, force-reinstall the headless variant.
 
 [phases.build]
-# Force-reinstall headless OpenCV to override the full GUI version that
-# ultralytics may have pulled in as a dependency.
 cmds = [
   "/opt/venv/bin/pip install --force-reinstall --no-deps opencv-python-headless"
 ]
