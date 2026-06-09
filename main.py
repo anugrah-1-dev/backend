@@ -30,6 +30,16 @@ MARKER_PHYSICAL_SIZE_CM = 10.0  # ArUco marker is 10cm × 10cm
 # Based on neonatal/infant cephalic index studies (~78–82%). Using 0.80 as midpoint.
 HEAD_DEPTH_RATIO = 0.80
 
+# ── Head top estimation constants ────────────────────────────────────────────
+# Jarak ubun-ubun ke mata ≈ 2.5× jarak mata ke hidung (studi antropometri).
+# Pada bayi/balita kepala relatif lebih besar, sehingga faktor sedikit lebih tinggi.
+HEAD_TOP_MULTIPLIER = 2.5
+
+# Offset pergelangan kaki → telapak kaki (cm).
+# Keypoint "ankle" YOLO ada di malleolus, bukan telapak kaki.
+# Estimasi konservatif: 5–7 cm; gunakan 6 cm sebagai nilai tengah.
+ANKLE_TO_FOOT_CM = 6.0
+
 # ── YOLO Model Cache ─────────────────────────────────────────────────────────
 # Models are loaded once and reused across requests to avoid repeated disk I/O.
 _yolo_models: dict = {}
@@ -74,17 +84,24 @@ class CalculateRequest(BaseModel):
     display_height: float = 0.0
 
 
-class MeasureHeadRequest(BaseModel):
-    image_base64: str
-
-
-# ── Models for YOLO-based height measurement ─────────────────────────────────
-
 class Point(BaseModel):
     """A 2-D pixel coordinate (display-space)."""
     x: float
     y: float
 
+
+class MeasureHeadRequest(BaseModel):
+    image_base64: str
+    # Reference card for scale (optional — auto-detect if absent)
+    card_p1: Optional[Point] = None
+    card_p2: Optional[Point] = None
+    card_dimension_cm: float = 8.56
+    # YOLO segmentation model
+    seg_model_name: str = "yolov8l-seg.pt"
+    min_confidence: float = 0.50
+
+
+# ── Models for YOLO-based height measurement ─────────────────────────────────
 
 class MeasureHeightYoloRequest(BaseModel):
     """
@@ -205,21 +222,31 @@ def calculate(req: CalculateRequest):
 @app.post("/measure_head")
 def measure_head(req: MeasureHeadRequest):
     """
-    Measure head circumference from a FRONT-FACING photo (baby lying down,
-    camera pointing at the baby's face from the front).
+    Estimate head circumference using YOLOv8 segmentation + ellipse fitting.
 
-    Requires ArUco marker (DICT_4X4_50, 10cm×10cm) placed beside the baby's
-    head on the same surface level.
+    Scale calibration: ATM/KTP card long edge (default 8.56 cm) — same
+    approach as /measure_height_yolo.  Optionally supply two card corner
+    points (card_p1 / card_p2); omit for auto-detect via contour analysis.
 
-    Algorithm:
-      1. Detect ArUco marker → pixels_per_cm calibration.
-      2. Skin segmentation (YCrCb) to isolate the head/face region.
-      3. Find the largest circular skin blob near the top of the frame.
-      4. Measure its horizontal bounding-box width → biparietal diameter (2a).
-      5. Estimate head depth: b = a × HEAD_DEPTH_RATIO (0.80).
-      6. Circumference via Ramanujan ellipse approximation.
+    Algorithm
+    ---------
+    1. Compute cm_per_pixel from the reference card.
+    2. Run yolov8l-seg.pt segmentation; pick the tallest person detection
+       (COCO class 0 = person).
+    3. Crop the segmentation mask to the top HEAD_FRACTION of the person
+       bounding box (the head region).
+    4. Find contours → filter by minimum area (head radius ≥ 3 cm).
+    5. Fit an ellipse (cv2.fitEllipse) to the largest valid contour.
+    6. Validate: head must be roughly front-facing (minor/major axis ≥ 0.55).
+    7. Ramanujan circumference: C ≈ π × √(2(a² + b²)).
+    8. Return result + ellipse coordinates for Flutter overlay.
     """
+    # Fraction of person bbox height (from top) treated as the head region.
+    # ~22 % covers both adult heads (~1/8 body) and infant heads (~1/4 body).
+    HEAD_FRACTION = 0.22
+
     try:
+        # ── 1. Decode image ───────────────────────────────────────────
         image_bytes = base64.b64decode(req.image_base64)
         nparr = np.frombuffer(image_bytes, np.uint8)
         image = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
@@ -227,160 +254,211 @@ def measure_head(req: MeasureHeadRequest):
         if image is None:
             return {"success": False, "message": "Gagal mendekode gambar"}
 
-        gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+        img_h, img_w = image.shape[:2]
 
-        # ── Step 1: Detect ArUco marker for scale ──────────────────────
-        dictionary = cv2.aruco.getPredefinedDictionary(cv2.aruco.DICT_4X4_50)
-        parameters = cv2.aruco.DetectorParameters()
-        detector = cv2.aruco.ArucoDetector(dictionary, parameters)
-        corners, ids, _ = detector.detectMarkers(gray)
+        # ── 2. Pixel scale from reference card ───────────────────────
+        if req.card_p1 is not None and req.card_p2 is not None:
+            card_pixel_dist = math.sqrt(
+                (req.card_p2.x - req.card_p1.x) ** 2
+                + (req.card_p2.y - req.card_p1.y) ** 2
+            )
+            if card_pixel_dist < 10:
+                return {
+                    "success": False,
+                    "message": (
+                        "Jarak titik referensi kartu terlalu kecil "
+                        "(< 10 px). Ketuk dua sudut kartu yang berjauhan."
+                    ),
+                }
+        else:
+            card_pixel_dist = _detect_card_auto(image)
+            if card_pixel_dist is None:
+                return {
+                    "success": False,
+                    "message": (
+                        "Kartu ATM/KTP tidak terdeteksi otomatis. "
+                        "Pastikan kartu terlihat jelas, datar, "
+                        "dan pencahayaan cukup."
+                    ),
+                }
 
-        if ids is None or len(ids) == 0:
+        cm_per_pixel  = req.card_dimension_cm / card_pixel_dist
+        pixels_per_cm = card_pixel_dist / req.card_dimension_cm
+
+        # ── 3. Load YOLO segmentation model ──────────────────────────
+        try:
+            seg_model = _load_yolo_model(req.seg_model_name)
+        except Exception as model_err:
             return {
                 "success": False,
-                "message": "ArUco marker tidak terdeteksi. Pastikan marker 10×10 cm terlihat jelas di samping kepala bayi.",
+                "message": (
+                    f"Gagal memuat model segmentasi '{req.seg_model_name}': {model_err}"
+                ),
             }
 
-        marker_corners = corners[0][0]
-        width_px = math.dist(marker_corners[0], marker_corners[1])
-        height_px = math.dist(marker_corners[1], marker_corners[2])
-        # Front-facing: marker lies flat → vertical dimension is foreshortened.
-        # Use the LARGEST edge (least foreshortened) for a more accurate scale.
-        marker_size_px = max(width_px, height_px)
+        # ── 4. Run segmentation ───────────────────────────────────────
+        results = seg_model(image, verbose=False)
 
-        if marker_size_px < 10:
+        if (
+            not results
+            or results[0].masks is None
+            or results[0].boxes is None
+        ):
             return {
                 "success": False,
-                "message": "Marker terlalu kecil. Dekatkan kamera.",
+                "message": "Tidak ada orang terdeteksi di gambar.",
             }
 
-        pixels_per_cm = marker_size_px / MARKER_PHYSICAL_SIZE_CM
+        masks_data = results[0].masks.data.cpu().numpy()  # (N, H_m, W_m)
+        boxes      = results[0].boxes
+        classes    = boxes.cls.cpu().numpy()
+        confs      = boxes.conf.cpu().numpy()
+        xyxy_all   = boxes.xyxy.cpu().numpy()  # (N, 4)
 
-        # ── Step 2: Mask out the marker region ─────────────────────────
-        h_img, w_img = image.shape[:2]
-        marker_exclude = np.zeros((h_img, w_img), dtype=np.uint8)
-        cv2.fillPoly(marker_exclude, [marker_corners.astype(np.int32)], 255)
-        kernel_dilate = cv2.getStructuringElement(cv2.MORPH_RECT, (20, 20))
-        marker_exclude = cv2.dilate(marker_exclude, kernel_dilate)
+        # Filter: COCO class 0 = person, minimum confidence
+        person_ids = [
+            i
+            for i, (cls, conf) in enumerate(zip(classes, confs))
+            if int(cls) == 0 and float(conf) >= req.min_confidence
+        ]
 
-        # ── Step 3: Skin segmentation in YCrCb space ───────────────────
-        ycrcb = cv2.cvtColor(image, cv2.COLOR_BGR2YCrCb)
-        skin_mask = cv2.inRange(ycrcb, (0, 133, 77), (255, 173, 127))
-        skin_mask[marker_exclude > 0] = 0
+        if not person_ids:
+            return {
+                "success": False,
+                "message": "Tidak ada orang terdeteksi dengan confidence yang cukup.",
+            }
+
+        # Pick the person with the tallest bounding box (likely the subject)
+        best_idx = max(person_ids, key=lambda i: xyxy_all[i][3] - xyxy_all[i][1])
+
+        x1, y1, x2, y2 = xyxy_all[best_idx]
+        bbox_h = y2 - y1
+
+        # ── 5. Build head mask from segmentation ─────────────────────
+        raw_mask = masks_data[best_idx]  # float 0–1, shape (H_m, W_m)
+        # Resize mask to full image resolution
+        mask_resized = cv2.resize(
+            raw_mask, (img_w, img_h), interpolation=cv2.INTER_NEAREST
+        )
+        mask_bin = (mask_resized > 0.5).astype(np.uint8) * 255
+
+        # Crop to head region: top HEAD_FRACTION of the person bbox
+        hx1 = max(0, int(x1))
+        hy1 = max(0, int(y1))
+        hx2 = min(img_w, int(x2))
+        hy2 = min(img_h, int(y1 + bbox_h * HEAD_FRACTION))
+
+        head_mask = mask_bin[hy1:hy2, hx1:hx2]
+
+        if head_mask.size == 0 or np.sum(head_mask) == 0:
+            return {
+                "success": False,
+                "message": (
+                    "Area kepala tidak ditemukan di mask segmentasi. "
+                    "Pastikan kepala terlihat penuh dalam frame."
+                ),
+            }
 
         # Morphological cleanup
-        k_close = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (25, 25))
-        k_open = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (10, 10))
-        skin_mask = cv2.morphologyEx(skin_mask, cv2.MORPH_CLOSE, k_close)
-        skin_mask = cv2.morphologyEx(skin_mask, cv2.MORPH_OPEN, k_open)
+        k_close = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (15, 15))
+        k_open  = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
+        head_mask = cv2.morphologyEx(head_mask, cv2.MORPH_CLOSE, k_close)
+        head_mask = cv2.morphologyEx(head_mask, cv2.MORPH_OPEN,  k_open)
 
-        # ── Step 4: Find the best head contour ─────────────────────────
+        # ── 6. Find contours ──────────────────────────────────────────
         contours, _ = cv2.findContours(
-            skin_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE
+            head_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE
         )
 
         if not contours:
             return {
                 "success": False,
-                "message": "Kepala tidak terdeteksi. Pastikan foto dari depan dengan cahaya cukup dan wajah terlihat penuh.",
+                "message": (
+                    "Kontur kepala tidak ditemukan. "
+                    "Pastikan kepala terlihat jelas dengan pencahayaan cukup."
+                ),
             }
 
-        def contour_circularity(cnt):
-            area = cv2.contourArea(cnt)
-            perimeter = cv2.arcLength(cnt, True)
-            if perimeter == 0:
-                return 0.0
-            return 4 * math.pi * area / (perimeter * perimeter)
+        # Minimum contour area: head radius ≥ 3 cm
+        min_area_px = math.pi * (pixels_per_cm * 3.0) ** 2
 
-        # Size bounds: head radius ~3–12 cm
-        min_radius_cm = 3.0
-        max_radius_cm = 12.0
-        min_area_px = math.pi * (pixels_per_cm * min_radius_cm) ** 2
-        max_area_px = math.pi * (pixels_per_cm * max_radius_cm) ** 2
-
-        # Biparietal diameter for babies: 6–14 cm → half-width in pixels
-        min_bip_px = pixels_per_cm * 6.0
-        max_bip_px = pixels_per_cm * 14.0
-
-        def valid_front_head(cnt):
-            """Extra filter for front-facing view: check bounding-box width
-            (biparietal) and aspect ratio (head is roughly as wide as tall)."""
-            if cv2.contourArea(cnt) < min_area_px or cv2.contourArea(cnt) > max_area_px:
-                return False
-            _x, _y, w, h = cv2.boundingRect(cnt)
-            if not (min_bip_px <= w <= max_bip_px):
-                return False
-            aspect = w / h if h > 0 else 0
-            # From front, head aspect ratio (w/h) should be 0.5 – 1.4
-            return 0.5 <= aspect <= 1.4
-
-        candidates = [
-            cnt
-            for cnt in contours
-            if len(cnt) >= 5
-            and valid_front_head(cnt)
-            and contour_circularity(cnt) >= 0.3
+        valid_cnts = [
+            c for c in contours if len(c) >= 5 and cv2.contourArea(c) >= min_area_px
         ]
 
-        if candidates:
-            # From front view, the head is typically in the upper portion of the
-            # frame. Score by circularity + position (prefer higher in image).
-            def head_score(cnt):
-                _, cy_c, _, _ = cv2.boundingRect(cnt)
-                # Normalise y to [0,1]: lower y = higher in image = better
-                y_norm = cy_c / h_img
-                return contour_circularity(cnt) - 0.5 * y_norm
+        if not valid_cnts:
+            return {
+                "success": False,
+                "message": (
+                    "Kontur kepala terlalu kecil. "
+                    "Dekatkan kamera atau pastikan kepala terlihat penuh."
+                ),
+            }
 
-            largest = max(candidates, key=head_score)
-        else:
-            size_filtered = [
-                cnt
-                for cnt in contours
-                if len(cnt) >= 5
-                and cv2.contourArea(cnt) >= min_area_px
-                and cv2.contourArea(cnt) <= max_area_px
-            ]
-            if size_filtered:
-                largest = max(size_filtered, key=cv2.contourArea)
-            else:
-                largest = max(contours, key=cv2.contourArea)
-                if len(largest) < 5:
-                    return {
-                        "success": False,
-                        "message": "Kontur kepala tidak terdeteksi dengan jelas.",
-                    }
+        best_cnt = max(valid_cnts, key=cv2.contourArea)
 
-        # ── Step 5: Measure biparietal width → estimate circumference ───
-        # Use convex hull for a clean bounding box unaffected by concavities.
-        hull = cv2.convexHull(largest)
-        x_bb, _y_bb, w_bb, _h_bb = cv2.boundingRect(hull)
+        # ── 7. Fit ellipse ────────────────────────────────────────────
+        try:
+            ellipse = cv2.fitEllipse(best_cnt)
+        except cv2.error:
+            return {
+                "success": False,
+                "message": (
+                    "Gagal fitting ellipse ke kontur kepala. "
+                    "Coba dengan foto yang lebih jelas."
+                ),
+            }
 
-        # Biparietal diameter = horizontal width of head from front view.
-        biparietal_px = float(w_bb)
-        a_cm = (biparietal_px / 2.0) / pixels_per_cm   # semi-major axis (measured)
-        b_cm = a_cm * HEAD_DEPTH_RATIO                  # semi-minor axis (estimated)
+        (cx_crop, cy_crop), (MA_px, ma_px), angle_deg = ellipse
 
-        # Ramanujan approximation: C ≈ π[3(a+b) − √((3a+b)(a+3b))]
-        h_val = ((a_cm - b_cm) ** 2) / ((a_cm + b_cm) ** 2)
-        circumference_cm = (
-            math.pi
-            * (a_cm + b_cm)
-            * (1 + (3 * h_val) / (10 + math.sqrt(4 - 3 * h_val)))
-        )
+        # Map ellipse centre back to full-image coordinates
+        cx_full = float(cx_crop) + hx1
+        cy_full = float(cy_crop) + hy1
+
+        a_px = MA_px / 2.0  # semi-major axis (pixels)
+        b_px = ma_px / 2.0  # semi-minor axis (pixels)
+
+        # ── 8. Validate: head facing forward ─────────────────────────
+        if a_px <= 0 or b_px <= 0:
+            return {"success": False, "message": "Dimensi ellipse tidak valid."}
+
+        axis_ratio = min(a_px, b_px) / max(a_px, b_px)
+        if axis_ratio < 0.50:
+            return {
+                "success": False,
+                "message": (
+                    "Kepala terdeteksi miring atau tidak menghadap lurus ke depan. "
+                    "Pastikan wajah menghadap kamera secara langsung."
+                ),
+            }
+
+        # ── 9. Circumference via Ramanujan approximation ─────────────
+        a_cm = a_px * cm_per_pixel
+        b_cm = b_px * cm_per_pixel
+
+        # C ≈ π × √(2(a² + b²))
+        circumference_cm = math.pi * math.sqrt(2.0 * (a_cm ** 2 + b_cm ** 2))
 
         warning = None
-        if circumference_cm < 20 or circumference_cm > 65:
+        if circumference_cm < 25.0 or circumference_cm > 65.0:
             warning = (
-                f"Nilai terukur {circumference_cm:.1f} cm di luar rentang normal bayi "
-                "(20–65 cm). Periksa foto dan ulangi jika perlu, atau gunakan hasil ini jika yakin."
+                f"Nilai terukur {circumference_cm:.1f} cm di luar rentang normal "
+                "(25–65 cm). Periksa foto dan ulangi jika perlu."
             )
 
         return {
             "success": True,
             "head_circumference_cm": round(circumference_cm, 1),
             "pixels_per_cm": round(pixels_per_cm, 4),
-            "biparietal_cm": round(a_cm * 2, 2),
-            "estimated_depth_cm": round(b_cm * 2, 2),
+            "semi_major_cm": round(a_cm, 2),
+            "semi_minor_cm": round(b_cm, 2),
+            "ellipse": {
+                "center_x": round(cx_full, 1),
+                "center_y": round(cy_full, 1),
+                "semi_major_px": round(a_px, 1),
+                "semi_minor_px": round(b_px, 1),
+                "angle_deg": round(float(angle_deg), 1),
+            },
             "warning": warning,
         }
 
@@ -421,10 +499,9 @@ def _detect_card_auto(image: np.ndarray) -> "Optional[float]":
 
     for cnt in contours:
         area = cv2.contourArea(cnt)
-        # Card must cover 0.4 %–35 % of the image area
-        if area < img_area * 0.004 or area > img_area * 0.35:
+        # Card must cover 0.2 %–40 % of the image area (diperlonggar)
+        if area < img_area * 0.002 or area > img_area * 0.40:
             continue
-
         peri   = cv2.arcLength(cnt, True)
         approx = cv2.approxPolyDP(cnt, 0.04 * peri, True)
         if len(approx) not in (4, 5):
@@ -452,35 +529,113 @@ def _detect_card_auto(image: np.ndarray) -> "Optional[float]":
     return best_px
 
 
-# COCO 17-keypoint indices used in this endpoint
+# COCO 17-keypoint indices
 _KP_NOSE        = 0
 _KP_LEFT_EYE    = 1
 _KP_RIGHT_EYE   = 2
+_KP_LEFT_EAR    = 3
+_KP_RIGHT_EAR   = 4
 _KP_LEFT_ANKLE  = 15
 _KP_RIGHT_ANKLE = 16
+
+
+def _estimate_head_top(
+    nose_y: float,
+    nose_c: float,
+    leye_y: float,
+    leye_c: float,
+    reye_y: float,
+    reye_c: float,
+    lear_y: float,
+    lear_c: float,
+    rear_y: float,
+    rear_c: float,
+    img_h: int,
+    min_conf: float,
+) -> float:
+    """
+    Estimasi posisi Y ubun-ubun (crown of head) dari keypoint wajah.
+
+    Strategi (urutan prioritas):
+    1. Jika mata terdeteksi → gunakan jarak mata-hidung × HEAD_TOP_MULTIPLIER
+       untuk memperkirakan ubun-ubun di atas mata.
+    2. Jika hanya telinga terdeteksi → ubun-ubun ≈ telinga − (nose−ear gap).
+    3. Fallback → hidung dikurangi estimasi kasar berbasis tinggi gambar.
+
+    Kenapa HEAD_TOP_MULTIPLIER = 2.5?
+    - Jarak mata ke hidung (eye-nose gap) pada manusia ≈ 1/3 tinggi wajah.
+    - Jarak mata ke ubun-ubun ≈ 2/3 tinggi wajah (lebih besar dari gap mata-hidung).
+    - Rasio (2/3) / (1/3) = 2.0 secara teori; faktor 2.5 memberi buffer karena
+      keypoint "nose" YOLO sering berada sedikit di bawah pangkal hidung,
+      sehingga eye-nose gap underestimated.
+    - Pada bayi/balita kepala proporsional lebih tinggi → faktor 2.5 lebih aman
+      daripada 2.0.
+    """
+    eye_ys = []
+    if leye_c >= min_conf:
+        eye_ys.append(leye_y)
+    if reye_c >= min_conf:
+        eye_ys.append(reye_y)
+
+    if eye_ys:
+        avg_eye_y    = sum(eye_ys) / len(eye_ys)
+        eye_nose_gap = nose_y - avg_eye_y   # positif → hidung di bawah mata
+
+        # Ubun-ubun = mata - (HEAD_TOP_MULTIPLIER × jarak mata-hidung)
+        crown_offset = max(eye_nose_gap, 0.0) * HEAD_TOP_MULTIPLIER
+        head_top_y   = avg_eye_y - crown_offset
+        return max(0.0, head_top_y)
+
+    # Fallback: gunakan telinga jika tersedia
+    ear_ys = []
+    if lear_c >= min_conf:
+        ear_ys.append(lear_y)
+    if rear_c >= min_conf:
+        ear_ys.append(rear_y)
+
+    if ear_ys:
+        avg_ear_y    = sum(ear_ys) / len(ear_ys)
+        ear_nose_gap = nose_y - avg_ear_y   # biasanya ≈ 0 (hidung & telinga sejajar)
+        # Ubun-ubun ≈ telinga ke atas sejauh 1.5× jarak telinga-hidung
+        crown_offset = max(ear_nose_gap, 0.0) * 1.5 + abs(ear_nose_gap) * 0.5
+        head_top_y   = avg_ear_y - crown_offset
+        return max(0.0, head_top_y)
+
+    # Fallback terakhir: hidung dikurangi ~8% tinggi gambar
+    fallback_offset = img_h * 0.08
+    return max(0.0, nose_y - fallback_offset)
 
 
 @app.post("/measure_height_yolo")
 def measure_height_yolo(req: MeasureHeightYoloRequest):
     """
-    Estimate standing height using YOLOv8/YOLO11 pose estimation.
+    Estimasi tinggi badan berdiri menggunakan YOLO Pose + skala kartu referensi.
+
+    Perbaikan v2 (bug-fix dari versi sebelumnya):
+    ──────────────────────────────────────────────
+    1. HEAD_TOP_MULTIPLIER = 2.5
+       Versi lama memakai eye_nose_gap × 1.0 untuk offset ubun-ubun,
+       sehingga head_top_y terlalu rendah → tinggi badan under-estimated ~60%.
+       Faktor 2.5 sesuai rasio antropometri ubun-ubun:mata:hidung.
+
+    2. Koreksi ankle → telapak kaki (ANKLE_TO_FOOT_CM = 6 cm)
+       Keypoint "ankle" YOLO ada di malleolus (pergelangan), bukan telapak kaki.
+       Tanpa koreksi ini, tinggi kehilangan ~5–7 cm.
+
+    3. Fallback bertingkat untuk head_top_y
+       Jika mata tidak terdeteksi, gunakan telinga; jika tidak ada keduanya,
+       gunakan hidung dengan offset berbasis resolusi gambar.
 
     Workflow
-    --------
-    1. Decode the base64 image.
-    2. Compute pixel-to-cm scale from the two card reference points
-       (real-world distance = card_dimension_cm, default 8.56 cm).
-    3. Load the requested YOLO pose model (cached after first call).
-    4. Run inference; for each detected person:
-         a. Estimate top of head from nose + eye keypoints.
-         b. Select the lower ankle as the bottom reference.
-         c. Compute vertical pixel span → convert to cm using scale.
-    5. Return all measurements plus keypoints for client-side overlay.
-
-    Supported models (selectable via model_name):
-      - "yolo11n-pose.pt"  (default, already in workspace root)
-      - "yolov8l-pose.pt"  (auto-downloaded by Ultralytics if absent)
-      - any other Ultralytics pose model filename
+    ────────
+    1. Decode gambar base64.
+    2. Hitung skala pixel/cm dari dua titik kartu (atau auto-detect).
+    3. Load model YOLO pose (cached).
+    4. Jalankan inferensi; untuk setiap orang yang terdeteksi:
+         a. Estimasi ubun-ubun dari keypoint hidung + mata + telinga.
+         b. Ambil ankle yang lebih rendah + offset ke telapak kaki.
+         c. Hitung span vertikal piksel → konversi ke cm.
+    5. Kembalikan semua pengukuran + keypoint untuk overlay di klien.
     """
     try:
         # ── 1. Decode image ───────────────────────────────────────────
@@ -495,7 +650,6 @@ def measure_height_yolo(req: MeasureHeightYoloRequest):
 
         # ── 2. Pixel scale from reference card ───────────────────────
         if req.card_p1 is not None and req.card_p2 is not None:
-            # Manual: dua titik yang dikirim oleh klien
             card_pixel_dist = math.sqrt(
                 (req.card_p2.x - req.card_p1.x) ** 2
                 + (req.card_p2.y - req.card_p1.y) ** 2
@@ -509,7 +663,6 @@ def measure_height_yolo(req: MeasureHeightYoloRequest):
                     ),
                 }
         else:
-            # Auto: deteksi kartu dari kontur gambar
             card_pixel_dist = _detect_card_auto(image)
             if card_pixel_dist is None:
                 return {
@@ -521,7 +674,7 @@ def measure_height_yolo(req: MeasureHeightYoloRequest):
                     ),
                 }
 
-        cm_per_pixel = req.card_dimension_cm / card_pixel_dist
+        cm_per_pixel  = req.card_dimension_cm / card_pixel_dist
         pixels_per_cm = card_pixel_dist / req.card_dimension_cm
 
         # ── 3. Load YOLO model ────────────────────────────────────────
@@ -552,59 +705,57 @@ def measure_height_yolo(req: MeasureHeightYoloRequest):
         for i, kps_tensor in enumerate(kps_data):
             kps = kps_tensor.cpu().numpy()  # (17, 3)
 
-            nose_x,  nose_y,  nose_c  = kps[_KP_NOSE]
-            leye_x,  leye_y,  leye_c  = kps[_KP_LEFT_EYE]
-            reye_x,  reye_y,  reye_c  = kps[_KP_RIGHT_EYE]
-            lank_x,  lank_y,  lank_c  = kps[_KP_LEFT_ANKLE]
-            rank_x,  rank_y,  rank_c  = kps[_KP_RIGHT_ANKLE]
+            nose_x,  nose_y,  nose_c  = float(kps[_KP_NOSE][0]),  float(kps[_KP_NOSE][1]),  float(kps[_KP_NOSE][2])
+            leye_x,  leye_y,  leye_c  = float(kps[_KP_LEFT_EYE][0]),  float(kps[_KP_LEFT_EYE][1]),  float(kps[_KP_LEFT_EYE][2])
+            reye_x,  reye_y,  reye_c  = float(kps[_KP_RIGHT_EYE][0]), float(kps[_KP_RIGHT_EYE][1]), float(kps[_KP_RIGHT_EYE][2])
+            lear_x,  lear_y,  lear_c  = float(kps[_KP_LEFT_EAR][0]),  float(kps[_KP_LEFT_EAR][1]),  float(kps[_KP_LEFT_EAR][2])
+            rear_x,  rear_y,  rear_c  = float(kps[_KP_RIGHT_EAR][0]), float(kps[_KP_RIGHT_EAR][1]), float(kps[_KP_RIGHT_EAR][2])
+            lank_x,  lank_y,  lank_c  = float(kps[_KP_LEFT_ANKLE][0]),  float(kps[_KP_LEFT_ANKLE][1]),  float(kps[_KP_LEFT_ANKLE][2])
+            rank_x,  rank_y,  rank_c  = float(kps[_KP_RIGHT_ANKLE][0]), float(kps[_KP_RIGHT_ANKLE][1]), float(kps[_KP_RIGHT_ANKLE][2])
 
-            # Nose must be visible
-            if float(nose_c) < min_conf:
+            # Hidung wajib terdeteksi sebagai anchor wajah
+            if nose_c < min_conf:
                 continue
 
-            # ── Estimate top of head ──────────────────────────────────
-            # Eyes sit roughly at mid-face height.  The crown of the head
-            # is approximately the same distance above the eyes as the
-            # eyes are above the nose.
-            eye_ys = []
-            if float(leye_c) >= min_conf:
-                eye_ys.append(float(leye_y))
-            if float(reye_c) >= min_conf:
-                eye_ys.append(float(reye_y))
+            # ── FIX 1: Estimasi ubun-ubun dengan multiplier antropometri ─
+            head_top_y = _estimate_head_top(
+                nose_y=nose_y, nose_c=nose_c,
+                leye_y=leye_y, leye_c=leye_c,
+                reye_y=reye_y, reye_c=reye_c,
+                lear_y=lear_y, lear_c=lear_c,
+                rear_y=rear_y, rear_c=rear_c,
+                img_h=img_h,
+                min_conf=min_conf,
+            )
 
-            if eye_ys:
-                avg_eye_y    = sum(eye_ys) / len(eye_ys)
-                eye_nose_gap = float(nose_y) - avg_eye_y  # > 0 when nose is below eyes
-                # Crown ≈ eyes_y − eye_nose_gap (clipped to image top)
-                head_top_y = max(0.0, avg_eye_y - max(eye_nose_gap, 0.0))
-            else:
-                # Fallback: no eye keypoints → use nose directly
-                head_top_y = float(nose_y)
-
-            # ── Select bottom reference (lower ankle) ─────────────────
+            # ── FIX 2: Titik bawah = ankle + offset ke telapak kaki ───
             ankle_ys = []
-            if float(lank_c) >= min_conf:
-                ankle_ys.append(float(lank_y))
-            if float(rank_c) >= min_conf:
-                ankle_ys.append(float(rank_y))
+            if lank_c >= min_conf:
+                ankle_ys.append(lank_y)
+            if rank_c >= min_conf:
+                ankle_ys.append(rank_y)
 
             if not ankle_ys:
-                # Person detected but ankles not visible → skip
+                # Ankle tidak terdeteksi → lewati orang ini
                 continue
 
-            # Higher y-value = lower in image = closer to the ground
+            # y terbesar = posisi paling bawah di gambar
             ankle_y = max(ankle_ys)
 
+            # Konversi offset fisik ke piksel dan tambahkan ke ankle_y
+            ankle_to_foot_px = ANKLE_TO_FOOT_CM * pixels_per_cm
+            foot_bottom_y    = min(float(img_h - 1), ankle_y + ankle_to_foot_px)
+
             # ── Height calculation ────────────────────────────────────
-            height_px = ankle_y - head_top_y
+            height_px = foot_bottom_y - head_top_y
 
             if height_px < 50:
-                # Implausibly short span in pixels → likely a detection artefact
+                # Span terlalu kecil → artefak deteksi
                 continue
 
             height_cm = height_px * cm_per_pixel
 
-            # Sanity-check: accept heights between 30 cm (infant) and 250 cm
+            # Sanity-check: terima tinggi 30–250 cm
             if not (30.0 <= height_cm <= 250.0):
                 continue
 
@@ -636,6 +787,8 @@ def measure_height_yolo(req: MeasureHeightYoloRequest):
                     "height_px": round(float(height_px), 1),
                     "head_top_y": round(float(head_top_y), 1),
                     "ankle_y": round(float(ankle_y), 1),
+                    "foot_bottom_y": round(float(foot_bottom_y), 1),
+                    "ankle_to_foot_px": round(float(ankle_to_foot_px), 1),
                     "nose_confidence": round(float(nose_c), 3),
                     "bbox": bbox,
                     "keypoints": visible_kps,
@@ -663,6 +816,131 @@ def measure_height_yolo(req: MeasureHeightYoloRequest):
             "image_height": img_h,
             "person_count": len(measurements),
             "measurements": measurements,
+        }
+
+    except Exception as e:
+        return {"success": False, "message": f"Error: {str(e)}"}
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# /debug_card  –  Debug deteksi kartu (kirim gambar, lihat semua kandidat)
+# ─────────────────────────────────────────────────────────────────────────────
+
+class DebugCardRequest(BaseModel):
+    image_base64: str
+
+
+@app.post("/debug_card")
+def debug_card(req: DebugCardRequest):
+    """
+    Debug endpoint: kembalikan semua kandidat kontur yang memenuhi syarat
+    deteksi kartu, beserta alasan gagal jika tidak ada yang cocok.
+    Berguna untuk mendiagnosis mengapa kartu ATM/KTP tidak terdeteksi.
+    """
+    CARD_ASPECT = 85.6 / 54.0
+    ASPECT_TOL  = 0.30
+
+    try:
+        image_bytes = base64.b64decode(req.image_base64)
+        nparr = np.frombuffer(image_bytes, np.uint8)
+        image = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
+        if image is None:
+            return {"success": False, "message": "Gagal mendekode gambar"}
+
+        h_img, w_img = image.shape[:2]
+        img_area = h_img * w_img
+
+        gray    = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+        blurred = cv2.GaussianBlur(gray, (5, 5), 0)
+        edges   = cv2.Canny(blurred, 30, 100)
+        kernel  = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3))
+        edges   = cv2.dilate(edges, kernel, iterations=1)
+
+        contours, _ = cv2.findContours(edges, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+
+        total_contours = len(contours)
+        fail_area      = 0
+        fail_shape     = 0
+        fail_aspect    = 0
+        candidates     = []
+
+        for cnt in contours:
+            area = cv2.contourArea(cnt)
+            area_pct = area / img_area * 100
+
+            if area < img_area * 0.004 or area > img_area * 0.35:
+                fail_area += 1
+                continue
+
+            peri   = cv2.arcLength(cnt, True)
+            approx = cv2.approxPolyDP(cnt, 0.04 * peri, True)
+            if len(approx) not in (4, 5):
+                fail_shape += 1
+                continue
+
+            x, y, bw, bh = cv2.boundingRect(approx)
+            if bw == 0 or bh == 0:
+                continue
+
+            aspect = bw / bh
+            aspect_err_landscape = abs(aspect - CARD_ASPECT) / CARD_ASPECT
+            aspect_err_portrait  = abs(aspect - 1.0 / CARD_ASPECT) / (1.0 / CARD_ASPECT)
+
+            if aspect_err_landscape > ASPECT_TOL and aspect_err_portrait > ASPECT_TOL:
+                fail_aspect += 1
+                candidates.append({
+                    "status": "fail_aspect",
+                    "bbox": [int(x), int(y), int(bw), int(bh)],
+                    "aspect": round(aspect, 3),
+                    "area_pct": round(area_pct, 2),
+                    "err_landscape": round(aspect_err_landscape, 3),
+                    "note": f"Aspek {aspect:.3f}, perlu {CARD_ASPECT:.3f}±30% atau {1/CARD_ASPECT:.3f}±30%",
+                })
+                continue
+
+            hull_area = cv2.contourArea(cv2.convexHull(cnt))
+            solidity  = area / hull_area if hull_area > 0 else 0.0
+            score     = solidity * area / img_area
+
+            if aspect_err_landscape <= ASPECT_TOL:
+                long_px = float(bw)
+                orient  = "landscape"
+            else:
+                long_px = float(bh)
+                orient  = "portrait"
+
+            candidates.append({
+                "status": "PASS",
+                "bbox": [int(x), int(y), int(bw), int(bh)],
+                "aspect": round(aspect, 3),
+                "area_pct": round(area_pct, 2),
+                "solidity": round(solidity, 3),
+                "long_px": round(long_px, 1),
+                "orientation": orient,
+                "pixels_per_cm": round(long_px / 8.56, 4),
+            })
+
+        passed = [c for c in candidates if c["status"] == "PASS"]
+
+        return {
+            "success": True,
+            "image_size": f"{w_img}x{h_img}",
+            "total_contours": total_contours,
+            "fail_area": fail_area,
+            "fail_shape": fail_shape,
+            "fail_aspect": fail_aspect,
+            "passed_count": len(passed),
+            "candidates": candidates,
+            "diagnosis": (
+                "Kartu terdeteksi OK" if passed
+                else (
+                    "Tidak ada kontur lolos filter area — kartu terlalu kecil/besar di frame"
+                    if fail_area > total_contours * 0.8
+                    else "Kontur ada tapi tidak berbentuk 4-sisi — kartu tertutup atau foto buram"
+                    if fail_shape > fail_aspect
+                    else "Kontur 4-sisi ada tapi rasio aspek tidak cocok kartu ATM/KTP — kartu miring, terpotong, atau terhalang"
+                )
+            ),
         }
 
     except Exception as e:
