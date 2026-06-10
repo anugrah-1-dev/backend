@@ -8,5 +8,6 @@
 
 [phases.build]
 cmds = [
-  "/opt/venv/bin/pip install --force-reinstall --no-deps opencv-python-headless"
+  "/opt/venv/bin/pip install --force-reinstall --no-deps opencv-python-headless",
+  "/opt/venv/bin/python -c \"from ultralytics import YOLO; YOLO('yolov8n-seg.pt')\""
 ]

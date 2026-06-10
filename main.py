@@ -96,8 +96,8 @@ class MeasureHeadRequest(BaseModel):
     card_p1: Optional[Point] = None
     card_p2: Optional[Point] = None
     card_dimension_cm: float = 8.56
-    # YOLO segmentation model
-    seg_model_name: str = "yolov8l-seg.pt"
+    # YOLO segmentation model — gunakan nano agar tidak OOM di Railway
+    seg_model_name: str = "yolov8n-seg.pt"
     min_confidence: float = 0.50
 
 
@@ -231,7 +231,7 @@ def measure_head(req: MeasureHeadRequest):
     Algorithm
     ---------
     1. Compute cm_per_pixel from the reference card.
-    2. Run yolov8l-seg.pt segmentation; pick the tallest person detection
+    2. Run yolov8n-seg.pt segmentation; pick the tallest person detection
        (COCO class 0 = person).
     3. Crop the segmentation mask to the top HEAD_FRACTION of the person
        bounding box (the head region).
@@ -475,58 +475,83 @@ def _detect_card_auto(image: np.ndarray) -> "Optional[float]":
     Automatically detect an ATM/KTP card (ISO 7810 ID-1: 85.6 × 54 mm).
     Returns the pixel length of the long (85.6 mm) edge, or None if not found.
 
-    Strategy: Canny edge detection → find 4-sided contours → filter by
-    the card aspect ratio (1.586 ± 30 %) → pick the best candidate.
+    Strategy (multi-pass):
+    Pass 1 – Adaptive threshold on grayscale (works for light-coloured cards).
+    Pass 2 – Canny edge detection (fallback for dark/coloured cards).
+    Both passes filter by card aspect ratio (1.586 ± 35%) and area (0.1%–45%).
     """
     CARD_ASPECT = 85.6 / 54.0   # ≈ 1.586
-    ASPECT_TOL  = 0.30           # ±30 %
+    ASPECT_TOL  = 0.35           # ±35 % — lebih toleran
 
     h_img, w_img = image.shape[:2]
     img_area     = h_img * w_img
 
-    gray    = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
-    blurred = cv2.GaussianBlur(gray, (5, 5), 0)
-    edges   = cv2.Canny(blurred, 30, 100)
-    kernel  = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3))
-    edges   = cv2.dilate(edges, kernel, iterations=1)
+    gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
 
-    contours, _ = cv2.findContours(
-        edges, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE
+    def _find_card_in_edges(edge_img: np.ndarray) -> "Optional[float]":
+        kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3))
+        dilated = cv2.dilate(edge_img, kernel, iterations=1)
+        contours, _ = cv2.findContours(
+            dilated, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE
+        )
+        best_px: Optional[float] = None
+        best_score: float        = -1.0
+
+        for cnt in contours:
+            area = cv2.contourArea(cnt)
+            # Card must cover 0.1 %–45 % of the image area
+            if area < img_area * 0.001 or area > img_area * 0.45:
+                continue
+
+            peri   = cv2.arcLength(cnt, True)
+            # Longgarkan epsilon supaya kontur bertekstur tetap terbaca sebagai 4-sisi
+            for eps_factor in (0.02, 0.04, 0.06):
+                approx = cv2.approxPolyDP(cnt, eps_factor * peri, True)
+                if len(approx) in (4, 5):
+                    break
+            else:
+                continue
+
+            x, y, bw, bh = cv2.boundingRect(approx)
+            if bw == 0 or bh == 0:
+                continue
+
+            aspect = bw / bh
+            if abs(aspect - CARD_ASPECT) / CARD_ASPECT <= ASPECT_TOL:
+                long_px = float(bw)
+            elif abs(aspect - 1.0 / CARD_ASPECT) / (1.0 / CARD_ASPECT) <= ASPECT_TOL:
+                long_px = float(bh)
+            else:
+                continue
+
+            hull_area = cv2.contourArea(cv2.convexHull(cnt))
+            solidity  = area / hull_area if hull_area > 0 else 0.0
+            score     = solidity * area / img_area
+            if score > best_score:
+                best_score = score
+                best_px    = long_px
+
+        return best_px
+
+    # ── Pass 1: Adaptive threshold (kartu terang di background gelap/beragam) ──
+    thresh = cv2.adaptiveThreshold(
+        gray, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+        cv2.THRESH_BINARY, 51, -10
     )
+    result = _find_card_in_edges(thresh)
+    if result is not None:
+        return result
 
-    best_px: Optional[float] = None
-    best_score: float        = -1.0
+    # ── Pass 2: Otsu threshold ────────────────────────────────────────────────
+    _, otsu = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+    result = _find_card_in_edges(otsu)
+    if result is not None:
+        return result
 
-    for cnt in contours:
-        area = cv2.contourArea(cnt)
-        # Card must cover 0.2 %–40 % of the image area (diperlonggar)
-        if area < img_area * 0.002 or area > img_area * 0.40:
-            continue
-        peri   = cv2.arcLength(cnt, True)
-        approx = cv2.approxPolyDP(cnt, 0.04 * peri, True)
-        if len(approx) not in (4, 5):
-            continue
-
-        _, _, bw, bh = cv2.boundingRect(approx)
-        if bw == 0 or bh == 0:
-            continue
-
-        aspect = bw / bh
-        if abs(aspect - CARD_ASPECT) / CARD_ASPECT <= ASPECT_TOL:
-            long_px = float(bw)          # landscape: width = 85.6 mm
-        elif abs(aspect - 1.0 / CARD_ASPECT) / (1.0 / CARD_ASPECT) <= ASPECT_TOL:
-            long_px = float(bh)          # portrait:  height = 85.6 mm
-        else:
-            continue
-
-        hull_area = cv2.contourArea(cv2.convexHull(cnt))
-        solidity  = area / hull_area if hull_area > 0 else 0.0
-        score     = solidity * area / img_area
-        if score > best_score:
-            best_score = score
-            best_px    = long_px
-
-    return best_px
+    # ── Pass 3: Canny (fallback untuk kartu gelap/berwarna) ───────────────────
+    blurred = cv2.GaussianBlur(gray, (5, 5), 0)
+    edges   = cv2.Canny(blurred, 20, 80)
+    return _find_card_in_edges(edges)
 
 
 # COCO 17-keypoint indices
