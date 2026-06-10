@@ -433,8 +433,25 @@ def measure_head(req: MeasureHeadRequest):
             }
 
         # ── 9. Circumference via Ramanujan approximation ─────────────
-        a_cm = a_px * cm_per_pixel
-        b_cm = b_px * cm_per_pixel
+        #
+        # Dari foto depan, axis minor ellipse = tinggi kepala yang terlihat,
+        # bukan kedalaman (AP) kepala. Lingkar kepala sesungguhnya membutuhkan
+        # lebar (W) dan kedalaman (AP = HEAD_DEPTH_RATIO × W).
+        #
+        # cv2.fitEllipse angle: sudut sumbu mayor terhadap sumbu-x (horizontal).
+        #   angle ≈ 0° / 180° → sumbu mayor vertikal → sumbu minor = lebar kepala
+        #   angle ≈ 90°       → sumbu mayor horizontal → sumbu mayor = lebar kepala
+        angle_mod = float(angle_deg) % 180.0
+        if 45.0 <= angle_mod <= 135.0:
+            # sumbu mayor (MA_px) lebih horizontal → lebar kepala
+            width_semi_px = a_px
+        else:
+            # sumbu mayor (MA_px) lebih vertikal → lebar kepala = sumbu minor
+            width_semi_px = b_px
+
+        # Semi-axis lebar (lateral) dan estimasi kedalaman (AP)
+        a_cm = width_semi_px * cm_per_pixel          # lebar/2
+        b_cm = a_cm * HEAD_DEPTH_RATIO               # kedalaman/2 ≈ 0.80 × lebar/2
 
         # C ≈ π × √(2(a² + b²))
         circumference_cm = math.pi * math.sqrt(2.0 * (a_cm ** 2 + b_cm ** 2))
@@ -481,7 +498,7 @@ def _detect_card_auto(image: np.ndarray) -> "Optional[float]":
     Both passes filter by card aspect ratio (1.586 ± 35%) and area (0.1%–45%).
     """
     CARD_ASPECT = 85.6 / 54.0   # ≈ 1.586
-    ASPECT_TOL  = 0.35           # ±35 % — lebih toleran
+    ASPECT_TOL  = 0.12           # ±12 % — cukup ketat agar wajah tidak ikut terdeteksi
 
     h_img, w_img = image.shape[:2]
     img_area     = h_img * w_img
@@ -526,6 +543,10 @@ def _detect_card_auto(image: np.ndarray) -> "Optional[float]":
 
             hull_area = cv2.contourArea(cv2.convexHull(cnt))
             solidity  = area / hull_area if hull_area > 0 else 0.0
+            # Kartu ATM berbentuk persegi panjang (solidity tinggi ≥ 0.75)
+            # Wajah/oval memiliki solidity lebih rendah
+            if solidity < 0.75:
+                continue
             score     = solidity * area / img_area
             if score > best_score:
                 best_score = score
