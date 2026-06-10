@@ -444,11 +444,13 @@ def measure_head(req: MeasureHeadRequest):
         #   angle ≈ 90°       → sumbu mayor horizontal → sumbu mayor = lebar kepala
         angle_mod = float(angle_deg) % 180.0
         if 45.0 <= angle_mod <= 135.0:
-            # sumbu mayor (MA_px) lebih horizontal → lebar kepala
-            width_semi_px = a_px
-        else:
-            # sumbu mayor (MA_px) lebih vertikal → lebar kepala = sumbu minor
+            # angle ≈ 90° → sumbu mayor VERTIKAL (tinggi kepala)
+            # → lebar kepala = sumbu MINOR = b_px
             width_semi_px = b_px
+        else:
+            # angle ≈ 0°/180° → sumbu mayor HORIZONTAL (lebar kepala)
+            # → lebar kepala = sumbu mayor = a_px
+            width_semi_px = a_px
 
         # Semi-axis lebar (lateral) dan estimasi kedalaman (AP)
         a_cm = width_semi_px * cm_per_pixel          # lebar/2
