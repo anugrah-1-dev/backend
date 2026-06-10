@@ -26,9 +26,10 @@ app.add_middleware(
 
 MARKER_PHYSICAL_SIZE_CM = 10.0  # ArUco marker is 10cm × 10cm
 
-# Anthropometric ratio: infant head depth (front-to-back) / width (left-right).
-# Based on neonatal/infant cephalic index studies (~78–82%). Using 0.80 as midpoint.
-HEAD_DEPTH_RATIO = 0.80
+# Anthropometric ratio: head AP depth (front-to-back) / width (left-right).
+# Cephalic index CI = W/AP ≈ 78–82% (mean ~80%). So AP/W = 1/CI ≈ 1.25.
+# HEAD_DEPTH_RATIO = AP/W = 1.25 (depth is LONGER than width for most humans).
+HEAD_DEPTH_RATIO = 1.25
 
 # ── Head top estimation constants ────────────────────────────────────────────
 # Jarak ubun-ubun ke mata ≈ 2.5× jarak mata ke hidung (studi antropometri).
