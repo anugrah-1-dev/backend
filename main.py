@@ -222,28 +222,38 @@ def calculate(req: CalculateRequest):
 @app.post("/measure_head")
 def measure_head(req: MeasureHeadRequest):
     """
-    Estimate head circumference using YOLOv8 segmentation + ellipse fitting.
+    Estimate head circumference from a TOP-DOWN photo (camera held above
+    baby's head, looking down) using YOLOv8 segmentation + ellipse fitting.
 
-    Scale calibration: ATM/KTP card long edge (default 8.56 cm) — same
-    approach as /measure_height_yolo.  Optionally supply two card corner
-    points (card_p1 / card_p2); omit for auto-detect via contour analysis.
+    Why top-down?
+    -------------
+    A front-view photo only captures head WIDTH and visible FACE HEIGHT, not
+    the front-to-back depth needed for circumference. Top-down view directly
+    captures both axes of the horizontal head cross-section (width × depth),
+    which is exactly what head circumference measures.
+
+    Scale calibration: ATM/KTP card long edge (default 8.56 cm). Card must be
+    placed at the SAME plane (height) as the head circumference plane,
+    otherwise perspective will skew the scale.
 
     Algorithm
     ---------
     1. Compute cm_per_pixel from the reference card.
-    2. Run yolov8n-seg.pt segmentation; pick the tallest person detection
-       (COCO class 0 = person).
-    3. Crop the segmentation mask to the top HEAD_FRACTION of the person
-       bounding box (the head region).
+    2. Run yolov8n-seg.pt segmentation; pick the largest person detection.
+       (Top-down view of a baby is detected as 'person' by COCO-trained YOLO.)
+    3. Use the ENTIRE person mask as the head region (user is instructed to
+       frame only head + card, so the mask is dominated by the head silhouette).
     4. Find contours → filter by minimum area (head radius ≥ 3 cm).
     5. Fit an ellipse (cv2.fitEllipse) to the largest valid contour.
-    6. Validate: head must be roughly front-facing (minor/major axis ≥ 0.55).
-    7. Ramanujan circumference: C ≈ π × √(2(a² + b²)).
+    6. Validate roundness: top-down head is fairly round (axis ratio ≥ 0.65).
+    7. Ramanujan circumference: C ≈ π × √(2(a² + b²)) where a, b are the
+       semi-axes of the fitted ellipse in cm.
     8. Return result + ellipse coordinates for Flutter overlay.
     """
-    # Fraction of person bbox height (from top) treated as the head region.
-    # ~22 % covers both adult heads (~1/8 body) and infant heads (~1/4 body).
-    HEAD_FRACTION = 0.22
+    # Fraction of person bbox treated as head region.
+    # For TOP-DOWN photos with proper framing (head fills frame), the whole
+    # bbox IS the head, so use 1.0.
+    HEAD_FRACTION = 1.0
 
     try:
         # ── 1. Decode image ───────────────────────────────────────────
@@ -418,17 +428,18 @@ def measure_head(req: MeasureHeadRequest):
         a_px = MA_px / 2.0  # semi-major axis (pixels)
         b_px = ma_px / 2.0  # semi-minor axis (pixels)
 
-        # ── 8. Validate: head facing forward ─────────────────────────
+        # ── 8. Validate: top-down head should be roughly round ───────
         if a_px <= 0 or b_px <= 0:
             return {"success": False, "message": "Dimensi ellipse tidak valid."}
 
         axis_ratio = min(a_px, b_px) / max(a_px, b_px)
-        if axis_ratio < 0.50:
+        if axis_ratio < 0.65:
             return {
                 "success": False,
                 "message": (
-                    "Kepala terdeteksi miring atau tidak menghadap lurus ke depan. "
-                    "Pastikan wajah menghadap kamera secara langsung."
+                    "Bentuk kepala terlalu lonjong. Pastikan foto diambil "
+                    "tegak lurus dari ATAS kepala (bukan miring), dan seluruh "
+                    "kepala terlihat dalam frame."
                 ),
             }
 
