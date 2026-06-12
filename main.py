@@ -26,10 +26,9 @@ app.add_middleware(
 
 MARKER_PHYSICAL_SIZE_CM = 10.0  # ArUco marker is 10cm × 10cm
 
-# Anthropometric ratio: head AP depth (front-to-back) / width (left-right).
-# Cephalic index CI = W/AP ≈ 78–82% (mean ~80%). So AP/W = 1/CI ≈ 1.25.
-# HEAD_DEPTH_RATIO = AP/W = 1.25 (depth is LONGER than width for most humans).
-HEAD_DEPTH_RATIO = 1.25
+# Anthropometric ratio: infant head depth (front-to-back) / width (left-right).
+# Based on neonatal/infant cephalic index studies (~78–82%). Using 0.80 as midpoint.
+HEAD_DEPTH_RATIO = 0.80
 
 # ── Head top estimation constants ────────────────────────────────────────────
 # Jarak ubun-ubun ke mata ≈ 2.5× jarak mata ke hidung (studi antropometri).
@@ -434,27 +433,8 @@ def measure_head(req: MeasureHeadRequest):
             }
 
         # ── 9. Circumference via Ramanujan approximation ─────────────
-        #
-        # Dari foto depan, axis minor ellipse = tinggi kepala yang terlihat,
-        # bukan kedalaman (AP) kepala. Lingkar kepala sesungguhnya membutuhkan
-        # lebar (W) dan kedalaman (AP = HEAD_DEPTH_RATIO × W).
-        #
-        # cv2.fitEllipse angle: sudut sumbu mayor terhadap sumbu-x (horizontal).
-        #   angle ≈ 0° / 180° → sumbu mayor vertikal → sumbu minor = lebar kepala
-        #   angle ≈ 90°       → sumbu mayor horizontal → sumbu mayor = lebar kepala
-        angle_mod = float(angle_deg) % 180.0
-        if 45.0 <= angle_mod <= 135.0:
-            # angle ≈ 90° → sumbu mayor VERTIKAL (tinggi kepala)
-            # → lebar kepala = sumbu MINOR = b_px
-            width_semi_px = b_px
-        else:
-            # angle ≈ 0°/180° → sumbu mayor HORIZONTAL (lebar kepala)
-            # → lebar kepala = sumbu mayor = a_px
-            width_semi_px = a_px
-
-        # Semi-axis lebar (lateral) dan estimasi kedalaman (AP)
-        a_cm = width_semi_px * cm_per_pixel          # lebar/2
-        b_cm = a_cm * HEAD_DEPTH_RATIO               # kedalaman/2 ≈ 0.80 × lebar/2
+        a_cm = a_px * cm_per_pixel
+        b_cm = b_px * cm_per_pixel
 
         # C ≈ π × √(2(a² + b²))
         circumference_cm = math.pi * math.sqrt(2.0 * (a_cm ** 2 + b_cm ** 2))
