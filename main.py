@@ -30,6 +30,17 @@ MARKER_PHYSICAL_SIZE_CM = 10.0  # ArUco marker is 10cm × 10cm
 # Based on neonatal/infant cephalic index studies (~78–82%). Using 0.80 as midpoint.
 HEAD_DEPTH_RATIO = 0.80
 
+# ── Head circumference (front-view) constants ────────────────────────────────
+# Cephalic index = (max breadth / max length) × 100. Infants are typically
+# mesocephalic (~76–82). Using 0.80 ⇒ head length (front-to-back) ≈ width / 0.80
+# = 1.25 × width. The front photo only shows the head WIDTH reliably, so we
+# estimate the unseen depth (length) from this ratio.
+HEAD_LENGTH_OVER_WIDTH = 1.25
+
+# Empirical correction multiplier applied to the final circumference.
+# Tune against a tape-measure reference (1.0 = no correction).
+HEAD_CIRCUMFERENCE_CORRECTION = 1.0
+
 # ── Head top estimation constants ────────────────────────────────────────────
 # Jarak ubun-ubun ke mata ≈ 2.5× jarak mata ke hidung (studi antropometri).
 # Pada bayi/balita kepala relatif lebih besar, sehingga faktor sedikit lebih tinggi.
@@ -92,12 +103,15 @@ class Point(BaseModel):
 
 class MeasureHeadRequest(BaseModel):
     image_base64: str
+    # Pre-calibrated scale (pixels per cm) from a fixed-distance jig.
+    # When provided, the reference card is ignored entirely.
+    pixels_per_cm: Optional[float] = None
     # Reference card for scale (optional — auto-detect if absent)
     card_p1: Optional[Point] = None
     card_p2: Optional[Point] = None
     card_dimension_cm: float = 8.56
     # YOLO segmentation model — gunakan nano agar tidak OOM di Railway
-    seg_model_name: str = "yolov8n-seg.pt"
+    seg_model_name: str = "yolo11n-seg.pt"
     min_confidence: float = 0.50
 
 
@@ -116,6 +130,9 @@ class MeasureHeightYoloRequest(BaseModel):
     card_p2: Optional[Point] = None
     # Real-world distance between the two card points (cm)
     card_dimension_cm: float = 8.56
+    # Pre-calibrated scale (pixels per cm) from a fixed-distance jig.
+    # When provided, the reference card is ignored entirely.
+    pixels_per_cm: Optional[float] = None
     # YOLO model filename.  Searched in workspace root then current dir.
     model_name: str = "yolo11n-pose.pt"
     # Minimum keypoint confidence to accept (0–1)
@@ -256,34 +273,39 @@ def measure_head(req: MeasureHeadRequest):
 
         img_h, img_w = image.shape[:2]
 
-        # ── 2. Pixel scale from reference card ───────────────────────
-        if req.card_p1 is not None and req.card_p2 is not None:
-            card_pixel_dist = math.sqrt(
-                (req.card_p2.x - req.card_p1.x) ** 2
-                + (req.card_p2.y - req.card_p1.y) ** 2
-            )
-            if card_pixel_dist < 10:
-                return {
-                    "success": False,
-                    "message": (
-                        "Jarak titik referensi kartu terlalu kecil "
-                        "(< 10 px). Ketuk dua sudut kartu yang berjauhan."
-                    ),
-                }
+        # ── 2. Pixel scale ───────────────────────────────────────────
+        # Priority 1: pre-calibrated scale from a fixed-distance jig.
+        if req.pixels_per_cm is not None and req.pixels_per_cm > 0:
+            pixels_per_cm = float(req.pixels_per_cm)
+            cm_per_pixel  = 1.0 / pixels_per_cm
         else:
-            card_pixel_dist = _detect_card_auto(image)
-            if card_pixel_dist is None:
-                return {
-                    "success": False,
-                    "message": (
-                        "Kartu ATM/KTP tidak terdeteksi otomatis. "
-                        "Pastikan kartu terlihat jelas, datar, "
-                        "dan pencahayaan cukup."
-                    ),
-                }
+            # Priority 2: reference card (manual points or auto-detect).
+            if req.card_p1 is not None and req.card_p2 is not None:
+                card_pixel_dist = math.sqrt(
+                    (req.card_p2.x - req.card_p1.x) ** 2
+                    + (req.card_p2.y - req.card_p1.y) ** 2
+                )
+                if card_pixel_dist < 10:
+                    return {
+                        "success": False,
+                        "message": (
+                            "Jarak titik referensi kartu terlalu kecil "
+                            "(< 10 px). Ketuk dua sudut kartu yang berjauhan."
+                        ),
+                    }
+            else:
+                card_pixel_dist = _detect_card_auto(image)
+                if card_pixel_dist is None:
+                    return {
+                        "success": False,
+                        "message": (
+                            "Skala belum dikalibrasi dan kartu tidak terdeteksi. "
+                            "Lakukan kalibrasi sekali di menu pengaturan."
+                        ),
+                    }
 
-        cm_per_pixel  = req.card_dimension_cm / card_pixel_dist
-        pixels_per_cm = card_pixel_dist / req.card_dimension_cm
+            cm_per_pixel  = req.card_dimension_cm / card_pixel_dist
+            pixels_per_cm = card_pixel_dist / req.card_dimension_cm
 
         # ── 3. Load YOLO segmentation model ──────────────────────────
         try:
@@ -415,8 +437,8 @@ def measure_head(req: MeasureHeadRequest):
         cx_full = float(cx_crop) + hx1
         cy_full = float(cy_crop) + hy1
 
-        a_px = MA_px / 2.0  # semi-major axis (pixels)
-        b_px = ma_px / 2.0  # semi-minor axis (pixels)
+        a_px = MA_px / 2.0  # semi-major axis (pixels) — for overlay only
+        b_px = ma_px / 2.0  # semi-minor axis (pixels) — for overlay only
 
         # ── 8. Validate: head facing forward ─────────────
         if a_px <= 0 or b_px <= 0:
@@ -432,12 +454,25 @@ def measure_head(req: MeasureHeadRequest):
                 ),
             }
 
-        # ── 9. Circumference via Ramanujan approximation ─────────────
-        a_cm = a_px * cm_per_pixel
-        b_cm = b_px * cm_per_pixel
+        # ── 9. Circumference from head WIDTH + cephalic ratio ────────
+        # A front photo only reveals the head WIDTH (left-right) reliably;
+        # the vertical extent of the crop includes the face/jaw and is not a
+        # clean anatomical landmark. We therefore take the horizontal extent
+        # of the head contour as the width and estimate the unseen depth
+        # (front-to-back length) from the infant cephalic ratio.
+        _, _, bw_px, _ = cv2.boundingRect(best_cnt)
+        width_cm  = float(bw_px) * cm_per_pixel          # head width (W)
+        length_cm = width_cm * HEAD_LENGTH_OVER_WIDTH     # head depth/length (L)
 
-        # C ≈ π × √(2(a² + b²))
-        circumference_cm = math.pi * math.sqrt(2.0 * (a_cm ** 2 + b_cm ** 2))
+        a_cm = length_cm / 2.0  # semi-major (depth)
+        b_cm = width_cm / 2.0   # semi-minor (width)
+
+        # Ramanujan ellipse perimeter: C ≈ π × √(2(a² + b²))
+        circumference_cm = (
+            math.pi
+            * math.sqrt(2.0 * (a_cm ** 2 + b_cm ** 2))
+            * HEAD_CIRCUMFERENCE_CORRECTION
+        )
 
         warning = None
         if circumference_cm < 25.0 or circumference_cm > 65.0:
@@ -450,6 +485,8 @@ def measure_head(req: MeasureHeadRequest):
             "success": True,
             "head_circumference_cm": round(circumference_cm, 1),
             "pixels_per_cm": round(pixels_per_cm, 4),
+            "head_width_cm": round(width_cm, 2),
+            "head_length_cm": round(length_cm, 2),
             "semi_major_cm": round(a_cm, 2),
             "semi_minor_cm": round(b_cm, 2),
             "ellipse": {
@@ -677,34 +714,39 @@ def measure_height_yolo(req: MeasureHeightYoloRequest):
 
         img_h, img_w = image.shape[:2]
 
-        # ── 2. Pixel scale from reference card ───────────────────────
-        if req.card_p1 is not None and req.card_p2 is not None:
-            card_pixel_dist = math.sqrt(
-                (req.card_p2.x - req.card_p1.x) ** 2
-                + (req.card_p2.y - req.card_p1.y) ** 2
-            )
-            if card_pixel_dist < 10:
-                return {
-                    "success": False,
-                    "message": (
-                        "Jarak titik referensi kartu terlalu kecil "
-                        "(< 10 px). Ketuk dua sudut kartu yang berjauhan."
-                    ),
-                }
+        # ── 2. Pixel scale ───────────────────────────────────────────
+        # Priority 1: pre-calibrated scale from a fixed-distance jig.
+        if req.pixels_per_cm is not None and req.pixels_per_cm > 0:
+            pixels_per_cm = float(req.pixels_per_cm)
+            cm_per_pixel  = 1.0 / pixels_per_cm
         else:
-            card_pixel_dist = _detect_card_auto(image)
-            if card_pixel_dist is None:
-                return {
-                    "success": False,
-                    "message": (
-                        "Kartu ATM/KTP tidak terdeteksi otomatis. "
-                        "Pastikan kartu terlihat jelas, datar, "
-                        "dan pencahayaan cukup."
-                    ),
-                }
+            # Priority 2: reference card (manual points or auto-detect).
+            if req.card_p1 is not None and req.card_p2 is not None:
+                card_pixel_dist = math.sqrt(
+                    (req.card_p2.x - req.card_p1.x) ** 2
+                    + (req.card_p2.y - req.card_p1.y) ** 2
+                )
+                if card_pixel_dist < 10:
+                    return {
+                        "success": False,
+                        "message": (
+                            "Jarak titik referensi kartu terlalu kecil "
+                            "(< 10 px). Ketuk dua sudut kartu yang berjauhan."
+                        ),
+                    }
+            else:
+                card_pixel_dist = _detect_card_auto(image)
+                if card_pixel_dist is None:
+                    return {
+                        "success": False,
+                        "message": (
+                            "Skala belum dikalibrasi dan kartu tidak terdeteksi. "
+                            "Lakukan kalibrasi sekali di menu pengaturan."
+                        ),
+                    }
 
-        cm_per_pixel  = req.card_dimension_cm / card_pixel_dist
-        pixels_per_cm = card_pixel_dist / req.card_dimension_cm
+            cm_per_pixel  = req.card_dimension_cm / card_pixel_dist
+            pixels_per_cm = card_pixel_dist / req.card_dimension_cm
 
         # ── 3. Load YOLO model ────────────────────────────────────────
         try:
